@@ -73,6 +73,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.math.BigInteger;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
@@ -1635,7 +1637,7 @@ public class S3Controller {
                 return handleDeleteObjects(bucket, body, httpHeaders, uriInfo);
             }
             if (contentType != null && contentType.startsWith("multipart/form-data")) {
-                return handlePresignedPost(bucket, contentType, body);
+                return handlePresignedPost(bucket, contentType, body, uriInfo);
             }
             if (hasQueryParam(uriInfo, "uploads") || hasQueryParam(uriInfo, "uploadId")) {
                 String actualBucket = resolveActualBucket(httpHeaders, uriInfo);
@@ -4118,9 +4120,9 @@ public class S3Controller {
         }
     }
 
-    private Response handlePresignedPost(String bucket, String contentType, byte[] body) {
+    private Response handlePresignedPost(String bucket, String contentType, byte[] body, UriInfo uriInfo) {
         try {
-            return doHandlePresignedPost(bucket, contentType, body);
+            return doHandlePresignedPost(bucket, contentType, body, uriInfo);
         } catch (AwsException e) {
             // Presigned POST errors must be returned as XML (matching LocalStack/AWS),
             // not JSON which is what the global AwsExceptionMapper would produce.
@@ -4128,7 +4130,7 @@ public class S3Controller {
         }
     }
 
-    private Response doHandlePresignedPost(String bucket, String contentType, byte[] body) {
+    private Response doHandlePresignedPost(String bucket, String contentType, byte[] body, UriInfo uriInfo) {
         String boundary = MultipartFormParser.extractBoundary(contentType).orElseThrow(() ->
                 new AwsException("InvalidArgument",
                         "Could not determine multipart boundary from Content-Type.", 400));
@@ -4224,18 +4226,8 @@ public class S3Controller {
                 .withSseCustomerKeyMd5(lcFields.get("x-amz-server-side-encryption-customer-key-md5")));
         LOG.infov("Presigned POST upload: {0}/{1} ({2} bytes)", bucket, key, fileData.length);
 
-        String xml = new XmlBuilder()
-                .raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
-                .start("PostResponse")
-                .elem("Location", bucket + "/" + key)
-                .elem("Bucket", bucket)
-                .elem("Key", key)
-                .elem("ETag", obj.getETag())
-                .end("PostResponse")
-                .build();
-        var response = Response.status(204)
-                .header("ETag", obj.getETag())
-                .header("Location", bucket + "/" + key);
+        Response.ResponseBuilder response = postSuccessResponse(lcFields, bucket, key, obj.getETag(), uriInfo)
+                .header("ETag", obj.getETag());
         if (obj.getServerSideEncryption() != null) {
             response.header("x-amz-server-side-encryption", obj.getServerSideEncryption());
         }
@@ -4246,6 +4238,83 @@ public class S3Controller {
             response.header("x-amz-version-id", obj.getVersionId());
         }
         return response.build();
+    }
+
+    /**
+     * How a stored POST Object answers, as the form asks: a usable {@code success_action_redirect}
+     * (or its legacy name {@code redirect}) wins with a 303, then {@code success_action_status}
+     * picks 201 with the PostResponse document or an empty 200, and anything else is an empty 204.
+     */
+    private static Response.ResponseBuilder postSuccessResponse(Map<String, String> lcFields, String bucket,
+                                                                String key, String etag, UriInfo uriInfo) {
+        String redirect = lcFields.get("success_action_redirect");
+        if (redirect == null || redirect.isEmpty()) {
+            redirect = lcFields.get("redirect");
+        }
+        Optional<String> redirectLocation = postRedirectLocation(redirect, bucket, key, etag);
+        if (redirectLocation.isPresent()) {
+            return Response.status(303).header("Location", redirectLocation.get());
+        }
+
+        String status = lcFields.get("success_action_status");
+        if (!"201".equals(status) && !"200".equals(status)) {
+            return Response.status(204).header("Location", bucket + "/" + key);
+        }
+        String baseUrl = uriInfo.getBaseUri().toString();
+        if (baseUrl.endsWith("/")) {
+            baseUrl = baseUrl.substring(0, baseUrl.length() - 1);
+        }
+        String objectUrl = baseUrl + "/" + bucket + "/" + key;
+        if ("200".equals(status)) {
+            return Response.status(200).header("Location", objectUrl);
+        }
+        String xml = new XmlBuilder()
+                .raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
+                .start("PostResponse")
+                .elem("Location", objectUrl)
+                .elem("Bucket", bucket)
+                .elem("Key", key)
+                .elem("ETag", etag)
+                .end("PostResponse")
+                .build();
+        return Response.status(201).entity(xml).type(MediaType.APPLICATION_XML).header("Location", objectUrl);
+    }
+
+    /**
+     * The redirect target with {@code bucket}, {@code key} and {@code etag} added to its query, ahead
+     * of any fragment. Empty when the form names no redirect or names one that is not an absolute URL
+     * with a host: S3 "acts as if the field is not present" for a URL it cannot interpret.
+     */
+    private static Optional<String> postRedirectLocation(String redirect, String bucket, String key, String etag) {
+        if (redirect == null || redirect.isEmpty()) {
+            return Optional.empty();
+        }
+        URI uri;
+        try {
+            uri = new URI(redirect);
+        } catch (URISyntaxException ignored) {
+            // Not an error: S3 treats an unparseable redirect as absent and answers by success_action_status.
+            return Optional.empty();
+        }
+        if (uri.getScheme() == null || uri.getRawAuthority() == null) {
+            return Optional.empty();
+        }
+        String target = uri.toASCIIString();
+        int fragmentStart = target.indexOf('#');
+        String fragment = fragmentStart < 0 ? "" : target.substring(fragmentStart);
+        String beforeFragment = fragmentStart < 0 ? target : target.substring(0, fragmentStart);
+        String rawQuery = uri.getRawQuery();
+        String separator = "&";
+        if (rawQuery == null) {
+            separator = "?";
+        } else if (rawQuery.isEmpty() || rawQuery.endsWith("&")) {
+            separator = "";
+        }
+        return Optional.of(beforeFragment + separator
+                + "bucket=" + SigV4Canonicalization.uriEncode(bucket)
+                + "&key=" + SigV4Canonicalization.uriEncode(key)
+                + "&etag=" + SigV4Canonicalization.uriEncode(etag)
+                + fragment);
     }
 
     /**

@@ -1,7 +1,9 @@
 package io.floci.aws.services.s3;
 
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.RestAssured;
 import io.restassured.response.ValidatableResponse;
+import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -16,6 +18,9 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.Base64;
+import java.util.HexFormat;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -27,6 +32,8 @@ class S3PresignedPostIntegrationTest {
 
     private static final String BUCKET = "presigned-post-bucket";
     private static final String VERSIONED_BUCKET = "presigned-post-versioned-bucket";
+    private static final String SUCCESS_ACTION_BUCKET = "presigned-post-success-action-bucket";
+    private static final String REDIRECT_URL = "http://localhost:8000/done";
     private static final DateTimeFormatter AMZ_DATE_FORMAT =
             DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC);
 
@@ -963,5 +970,368 @@ class S3PresignedPostIntegrationTest {
         .then()
             .statusCode(200)
             .header("x-amz-version-id", is(versionId));
+    }
+
+    @Test
+    @Order(120)
+    void createSuccessActionBucket() {
+        given()
+        .when()
+            .put("/" + SUCCESS_ACTION_BUCKET)
+        .then()
+            .statusCode(200);
+    }
+
+    @Test
+    @Order(121)
+    void successActionRedirectAnswers303WithBucketKeyAndEtag() throws Exception {
+        String key = "uploads/redirect me.txt";
+        String content = "redirected upload";
+
+        postForm(SUCCESS_ACTION_BUCKET, key, content, Map.of("success_action_redirect", REDIRECT_URL))
+            .statusCode(303)
+            .header("Location", equalTo(REDIRECT_URL + "?bucket=" + SUCCESS_ACTION_BUCKET
+                    + "&key=uploads%2Fredirect%20me.txt&etag=%22" + md5Hex(content) + "%22"))
+            .header("ETag", equalTo("\"" + md5Hex(content) + "\""))
+            .body(is(emptyString()));
+
+        assertStored(SUCCESS_ACTION_BUCKET, key, content);
+    }
+
+    @Test
+    @Order(122)
+    void successActionRedirectAppendsToAnExistingQueryString() throws Exception {
+        String key = "uploads/redirect-query.txt";
+        String content = "redirect with a query";
+
+        postForm(SUCCESS_ACTION_BUCKET, key, content,
+                Map.of("success_action_redirect", REDIRECT_URL + "?session=abc"))
+            .statusCode(303)
+            .header("Location", equalTo(REDIRECT_URL + "?session=abc&bucket=" + SUCCESS_ACTION_BUCKET
+                    + "&key=uploads%2Fredirect-query.txt&etag=%22" + md5Hex(content) + "%22"));
+
+        assertStored(SUCCESS_ACTION_BUCKET, key, content);
+    }
+
+    @Test
+    @Order(123)
+    void successActionRedirectKeepsTheFragmentAfterTheQuery() throws Exception {
+        String key = "uploads/redirect-fragment.txt";
+        String content = "redirect with a fragment";
+
+        postForm(SUCCESS_ACTION_BUCKET, key, content,
+                Map.of("success_action_redirect", "http://localhost:8000/app#/done"))
+            .statusCode(303)
+            .header("Location", equalTo("http://localhost:8000/app?bucket=" + SUCCESS_ACTION_BUCKET
+                    + "&key=uploads%2Fredirect-fragment.txt&etag=%22" + md5Hex(content) + "%22#/done"));
+
+        assertStored(SUCCESS_ACTION_BUCKET, key, content);
+    }
+
+    @Test
+    @Order(124)
+    void legacyRedirectFieldRedirects() throws Exception {
+        String key = "uploads/legacy-redirect.txt";
+        String content = "legacy redirect";
+
+        postForm(SUCCESS_ACTION_BUCKET, key, content, Map.of("redirect", REDIRECT_URL))
+            .statusCode(303)
+            .header("Location", equalTo(REDIRECT_URL + "?bucket=" + SUCCESS_ACTION_BUCKET
+                    + "&key=uploads%2Flegacy-redirect.txt&etag=%22" + md5Hex(content) + "%22"));
+
+        assertStored(SUCCESS_ACTION_BUCKET, key, content);
+    }
+
+    @Test
+    @Order(125)
+    void successActionRedirectWinsOverLegacyRedirect() {
+        String key = "uploads/both-redirects.txt";
+        String content = "both redirect fields";
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("redirect", "http://localhost:8000/legacy");
+        fields.put("success_action_redirect", REDIRECT_URL);
+
+        postForm(SUCCESS_ACTION_BUCKET, key, content, fields)
+            .statusCode(303)
+            .header("Location", startsWith(REDIRECT_URL + "?bucket="));
+
+        assertStored(SUCCESS_ACTION_BUCKET, key, content);
+    }
+
+    @Test
+    @Order(126)
+    void successActionRedirectWinsOverSuccessActionStatus() {
+        String key = "uploads/redirect-and-status.txt";
+        String content = "redirect and status";
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("success_action_status", "201");
+        fields.put("success_action_redirect", REDIRECT_URL);
+
+        postForm(SUCCESS_ACTION_BUCKET, key, content, fields)
+            .statusCode(303)
+            .header("Location", startsWith(REDIRECT_URL + "?bucket="))
+            .body(is(emptyString()));
+
+        assertStored(SUCCESS_ACTION_BUCKET, key, content);
+    }
+
+    @Test
+    @Order(127)
+    void successActionFieldNamesAreCaseInsensitive() {
+        String key = "uploads/mixed-case-redirect.txt";
+        String content = "mixed case field name";
+
+        postForm(SUCCESS_ACTION_BUCKET, key, content, Map.of("Success_Action_Redirect", REDIRECT_URL))
+            .statusCode(303)
+            .header("Location", startsWith(REDIRECT_URL + "?bucket="));
+
+        assertStored(SUCCESS_ACTION_BUCKET, key, content);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"/relative/done", "not a url", "mailto:someone@example.com"})
+    @Order(128)
+    void redirectThatIsNotAnAbsoluteUrlFallsBackToSuccessActionStatus(String redirect) {
+        String key = "uploads/unusable-redirect.txt";
+        String content = "unusable redirect";
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("success_action_redirect", redirect);
+        fields.put("success_action_status", "200");
+
+        postForm(SUCCESS_ACTION_BUCKET, key, content, fields)
+            .statusCode(200)
+            .body(is(emptyString()));
+
+        assertStored(SUCCESS_ACTION_BUCKET, key, content);
+    }
+
+    @Test
+    @Order(129)
+    void successActionStatus201ReturnsPostResponseXml() throws Exception {
+        String key = "uploads/created.txt";
+        String content = "created upload";
+        String objectUrl = "http://localhost:" + RestAssured.port + "/" + SUCCESS_ACTION_BUCKET + "/" + key;
+        String etag = "\"" + md5Hex(content) + "\"";
+
+        postForm(SUCCESS_ACTION_BUCKET, key, content, Map.of("success_action_status", "201"))
+            .statusCode(201)
+            .contentType("application/xml")
+            .header("Location", equalTo(objectUrl))
+            .header("ETag", equalTo(etag))
+            .body(hasXPath("/PostResponse/Location", equalTo(objectUrl)))
+            .body(hasXPath("/PostResponse/Bucket", equalTo(SUCCESS_ACTION_BUCKET)))
+            .body(hasXPath("/PostResponse/Key", equalTo(key)))
+            .body(hasXPath("/PostResponse/ETag", equalTo(etag)));
+
+        assertStored(SUCCESS_ACTION_BUCKET, key, content);
+    }
+
+    @Test
+    @Order(130)
+    void successActionStatus200ReturnsEmpty200() throws Exception {
+        String key = "uploads/ok.txt";
+        String content = "ok upload";
+
+        postForm(SUCCESS_ACTION_BUCKET, key, content, Map.of("success_action_status", "200"))
+            .statusCode(200)
+            .header("ETag", equalTo("\"" + md5Hex(content) + "\""))
+            .body(is(emptyString()));
+
+        assertStored(SUCCESS_ACTION_BUCKET, key, content);
+    }
+
+    @Test
+    @Order(131)
+    void postWithoutSuccessActionFieldsStillAnswers204() throws Exception {
+        String key = "uploads/no-success-action.txt";
+        String content = "plain upload";
+
+        postForm(SUCCESS_ACTION_BUCKET, key, content, Map.of())
+            .statusCode(204)
+            .header("Location", equalTo(SUCCESS_ACTION_BUCKET + "/" + key))
+            .header("ETag", equalTo("\"" + md5Hex(content) + "\""))
+            .body(is(emptyString()));
+
+        assertStored(SUCCESS_ACTION_BUCKET, key, content);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"204", "202", "created", ""})
+    @Order(132)
+    void anyOtherSuccessActionStatusAnswers204(String status) {
+        String key = "uploads/other-status.txt";
+        String content = "other status";
+
+        postForm(SUCCESS_ACTION_BUCKET, key, content, Map.of("success_action_status", status))
+            .statusCode(204)
+            .body(is(emptyString()));
+
+        assertStored(SUCCESS_ACTION_BUCKET, key, content);
+    }
+
+    @Test
+    @Order(133)
+    void policyStartsWithOnSuccessActionRedirectAcceptsAMatchingValue() {
+        String key = "uploads/policy-redirect-ok.txt";
+        String content = "policy allows this redirect";
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("policy", redirectPrefixPolicy("http://localhost:8000/"));
+        fields.put("success_action_redirect", REDIRECT_URL);
+
+        postForm(SUCCESS_ACTION_BUCKET, key, content, fields)
+            .statusCode(303)
+            .header("Location", startsWith(REDIRECT_URL + "?bucket="));
+
+        assertStored(SUCCESS_ACTION_BUCKET, key, content);
+    }
+
+    @Test
+    @Order(134)
+    void policyStartsWithOnSuccessActionRedirectRejectsAnotherValue() {
+        String key = "uploads/policy-redirect-denied.txt";
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("policy", redirectPrefixPolicy("http://localhost:8000/"));
+        fields.put("success_action_redirect", "http://evil.example.com/done");
+
+        postForm(SUCCESS_ACTION_BUCKET, key, "policy refuses this redirect", fields)
+            .statusCode(403)
+            .contentType("application/xml")
+            .body(hasXPath("/Error/Code", equalTo("AccessDenied")))
+            .body(hasXPath("/Error/Message", equalTo(
+                    "Invalid according to Policy: Policy Condition failed: "
+                            + "[\"starts-with\", \"$success_action_redirect\", \"http://localhost:8000/\"]")));
+
+        given()
+        .when()
+            .head("/" + SUCCESS_ACTION_BUCKET + "/" + key)
+        .then()
+            .statusCode(404);
+    }
+
+    @Test
+    @Order(135)
+    void policyStartsWithOnSuccessActionRedirectRejectsAMissingField() {
+        String key = "uploads/policy-redirect-missing.txt";
+
+        postForm(SUCCESS_ACTION_BUCKET, key, "policy wants a redirect",
+                Map.of("policy", redirectPrefixPolicy("http://localhost:8000/")))
+            .statusCode(403)
+            .body(hasXPath("/Error/Code", equalTo("AccessDenied")));
+
+        given()
+        .when()
+            .head("/" + SUCCESS_ACTION_BUCKET + "/" + key)
+        .then()
+            .statusCode(404);
+    }
+
+    @Test
+    @Order(136)
+    void policyEqOnSuccessActionStatusIsEnforced() {
+        String okKey = "uploads/policy-status-ok.txt";
+        String deniedKey = "uploads/policy-status-denied.txt";
+        String content = "policy pins the status";
+        String policy = Base64.getEncoder().encodeToString("""
+                {
+                  "expiration": "%s",
+                  "conditions": [
+                    {"bucket": "%s"},
+                    ["starts-with", "$key", "uploads/"],
+                    ["eq", "$success_action_status", "201"]
+                  ]
+                }
+                """.formatted(Instant.now().plusSeconds(3600), SUCCESS_ACTION_BUCKET)
+                .getBytes(StandardCharsets.UTF_8));
+
+        Map<String, String> matching = new LinkedHashMap<>();
+        matching.put("policy", policy);
+        matching.put("success_action_status", "201");
+        postForm(SUCCESS_ACTION_BUCKET, okKey, content, matching)
+            .statusCode(201);
+        assertStored(SUCCESS_ACTION_BUCKET, okKey, content);
+
+        Map<String, String> mismatching = new LinkedHashMap<>();
+        mismatching.put("policy", policy);
+        mismatching.put("success_action_status", "200");
+        postForm(SUCCESS_ACTION_BUCKET, deniedKey, content, mismatching)
+            .statusCode(403)
+            .body(hasXPath("/Error/Code", equalTo("AccessDenied")))
+            .body(hasXPath("/Error/Message", equalTo(
+                    "Invalid according to Policy: Policy Condition failed: "
+                            + "[\"eq\", \"$success_action_status\", \"201\"]")));
+
+        given()
+        .when()
+            .head("/" + SUCCESS_ACTION_BUCKET + "/" + deniedKey)
+        .then()
+            .statusCode(404);
+    }
+
+    @Test
+    @Order(137)
+    void successActionRedirectKeepsEncryptionAndVersionHeaders() {
+        String bucket = "presigned-post-redirect-versioned-bucket";
+        String key = "uploads/encrypted-redirect.txt";
+        String content = "encrypted and versioned redirect";
+        given().put("/" + bucket).then().statusCode(200);
+        given()
+            .body("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>")
+        .when()
+            .put("/" + bucket + "?versioning")
+        .then()
+            .statusCode(200);
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("x-amz-server-side-encryption", "AES256");
+        fields.put("success_action_redirect", REDIRECT_URL);
+
+        String versionId = postForm(bucket, key, content, fields)
+            .statusCode(303)
+            .header("x-amz-server-side-encryption", equalTo("AES256"))
+            .extract().header("x-amz-version-id");
+
+        assertThat(versionId, is(notNullValue()));
+        assertStored(bucket, key, content);
+    }
+
+    private ValidatableResponse postForm(String bucket, String key, String content, Map<String, String> fields) {
+        RequestSpecification request = given()
+            .redirects().follow(false)
+            .multiPart("key", key);
+        for (Map.Entry<String, String> field : fields.entrySet()) {
+            request = request.multiPart(field.getKey(), field.getValue());
+        }
+        return request
+            .multiPart("file", "upload.txt", content.getBytes(StandardCharsets.UTF_8), "text/plain")
+        .when()
+            .post("/" + bucket)
+        .then();
+    }
+
+    private void assertStored(String bucket, String key, String content) {
+        given()
+        .when()
+            .get("/" + bucket + "/" + key)
+        .then()
+            .statusCode(200)
+            .body(equalTo(content));
+    }
+
+    private String redirectPrefixPolicy(String redirectPrefix) {
+        String policy = """
+                {
+                  "expiration": "%s",
+                  "conditions": [
+                    {"bucket": "%s"},
+                    ["starts-with", "$key", "uploads/"],
+                    ["starts-with", "$success_action_redirect", "%s"]
+                  ]
+                }
+                """.formatted(Instant.now().plusSeconds(3600), SUCCESS_ACTION_BUCKET, redirectPrefix);
+        return Base64.getEncoder().encodeToString(policy.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static String md5Hex(String content) throws Exception {
+        return HexFormat.of().formatHex(
+                MessageDigest.getInstance("MD5").digest(content.getBytes(StandardCharsets.UTF_8)));
     }
 }
